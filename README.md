@@ -6,7 +6,7 @@ A highly structured, state-driven backend architecture that automates your end-t
 
 ## 🏗️ System Architecture & Agent Graph
 
-The system coordinates **8 specialized agents** utilizing LangGraph's state machine management with native human-in-the-loop validation checkpoints (`interrupt`):
+The system coordinates **3 specialized agents** utilizing LangGraph's state machine management with native human-in-the-loop validation checkpoints (`interrupt`):
 
 ```mermaid
 graph TD
