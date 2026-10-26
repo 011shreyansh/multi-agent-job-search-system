@@ -237,7 +237,8 @@ Return ONLY valid JSON:
 
 
 def search_jobs(query, location):
-    client = serpapi.Client(api_key=os.getenv("SERPAPI_API_KEY"))
+    api_key = os.getenv("SERPAPI_KEY") or os.getenv("SERPAPI_API_KEY")
+    client = serpapi.Client(api_key=api_key)
 
     results = client.search(
         engine="google_jobs",
