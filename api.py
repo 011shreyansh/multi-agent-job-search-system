@@ -172,6 +172,7 @@ INPUT_TYPES = {
     'job_selection': 'job_selection',
     'resume_review': 'resume_feedback',
     'final_review': 'final_approval',
+    'submit_confirmation': 'submit_confirmation',
 }
 
 

@@ -2,6 +2,7 @@ import os
 import json
 import re
 import sys
+import tempfile
 from typing import TypedDict
 
 import pymupdf
@@ -30,7 +31,7 @@ class State(TypedDict):
     feedback: str
     cover_letter: str
     approval: str
-    application_status: str  # FIX: was written by application_agent but never declared
+    application_status: str   
 
 
 # --------------------------------------------------------------------------
@@ -102,7 +103,7 @@ def parse_review(result):
         return "approve", ""
 
     if not feedback and approval.strip().lower() not in {"", "revise", "reject", "no", "n"}:
-        feedback = approval.strip()  # a free-text answer IS the feedback
+        feedback = approval.strip()   
 
     return "revise", feedback
 
@@ -195,7 +196,7 @@ def preference_agent(state):
         "profile": profile
     })
 
-    # FIX: the API sends a string; the old code called .get() on it and crashed
+    
     prefs = parse_preferences(answer)
 
     return {
@@ -250,13 +251,17 @@ def search_jobs(query, location):
     cleaned = []
 
     for job in jobs:
+        apply_options = job.get("apply_options", [])
+        direct_link = apply_options[0].get("link", "") if apply_options else ""
         cleaned.append({
             "title": job.get("title", ""),
             "company": job.get("company_name", ""),
             "location": job.get("location", ""),
             "description": job.get("description", ""),
             "via": job.get("via", ""),
-            "link": job.get("share_link", ""),
+            "link": direct_link or job.get("share_link", ""),
+            "share_link": job.get("share_link", ""),
+            "apply_options": apply_options,
             "extensions": job.get("detected_extensions", {})
         })
 
@@ -305,7 +310,7 @@ Each item must contain:
     response = llm.invoke(prompt)
     ranked_jobs = extract_json(text_from_response(response))
 
-    # Be forgiving if the model wraps the array in an object
+    
     if isinstance(ranked_jobs, dict):
         ranked_jobs = next(
             (v for v in ranked_jobs.values() if isinstance(v, list)), []
@@ -326,7 +331,7 @@ def show_jobs(state):
         "message": "Select a job"
     })
 
-    # FIX: accept {"index": 2}, "2", or 2
+     
     raw = selected.get("index", 1) if isinstance(selected, dict) else selected
     try:
         index = int(raw) - 1
@@ -431,7 +436,7 @@ def final_review(state):
         "message": "Approve the application or request changes"
     })
 
-    # FIX: feedback is now stored, so a rejection actually changes the next draft
+     
     approval, feedback = parse_review(result)
 
     return {
@@ -447,8 +452,211 @@ def final_review_route(state):
     return "tailor_resume"
 
 
+def text_to_pdf(text: str, output_path: str):
+    """Convert raw text or markdown into a paginated PDF for ATS upload."""
+    doc = pymupdf.open()
+    margin = 40
+    page_width, page_height = 595, 842  # A4
+    page = doc.new_page(width=page_width, height=page_height)
+    y = margin + 10
+    line_height = 14
+
+    for raw_line in (text or "").split("\n"):
+        line = raw_line.rstrip()
+        max_chars = 95
+        chunks = [line[i:i + max_chars] for i in range(0, max(len(line), 1), max_chars)]
+        for chunk in chunks:
+            if y + line_height > page_height - margin:
+                page = doc.new_page(width=page_width, height=page_height)
+                y = margin + 10
+            page.insert_text((margin, y), chunk, fontsize=10, fontname="helv")
+            y += line_height
+
+    doc.save(output_path)
+    doc.close()
+
+
+def launch_playwright_browser(playwright_ctx, headless: bool = False):
+    """Launch system Chrome or Edge for maximum bot detection resistance."""
+    for channel in ["chrome", "msedge", None]:
+        try:
+            kwargs = {"headless": headless}
+            if channel:
+                kwargs["channel"] = channel
+            return playwright_ctx.chromium.launch(**kwargs)
+        except Exception:
+            continue
+    return playwright_ctx.chromium.launch(headless=headless)
+
+
+def autofill_job_application(page, profile: dict, resume_pdf_path: str, cover_letter: str = ""):
+    """Intelligently detects and pre-fills common applicant form fields."""
+    filled = []
+
+    name = profile.get("name", "")
+    email = profile.get("email", "")
+    phone = profile.get("phone", "")
+
+    location = profile.get("location", {})
+    if isinstance(location, dict):
+        city = location.get("city", "")
+        state_loc = location.get("state", "")
+        loc_str = f"{city}, {state_loc}".strip(", ")
+    else:
+        loc_str = str(location or "")
+
+    social = profile.get("social_links", {})
+    linkedin = social.get("linkedin", "") if isinstance(social, dict) else ""
+    github = social.get("github", "") if isinstance(social, dict) else ""
+
+    parts = name.split()
+    first_name = parts[0] if parts else ""
+    last_name = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+    mappings = [
+        ("input[name*='name' i]:not([name*='first' i]):not([name*='last' i]), input[id*='name' i]:not([id*='first' i]):not([id*='last' i]), input[autocomplete='name']", name, "Full Name"),
+        ("input[name*='first' i], input[id*='first' i], input[autocomplete='given-name']", first_name, "First Name"),
+        ("input[name*='last' i], input[id*='last' i], input[autocomplete='family-name']", last_name, "Last Name"),
+        ("input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='email']", email, "Email"),
+        ("input[type='tel'], input[name*='phone' i], input[id*='phone' i], input[name*='mobile' i]", phone, "Phone"),
+        ("input[name*='city' i], input[name*='location' i], input[id*='location' i]", loc_str, "Location"),
+        ("input[name*='linkedin' i], input[id*='linkedin' i]", linkedin, "LinkedIn"),
+        ("input[name*='github' i], input[name*='website' i], input[id*='github' i], input[name*='portfolio' i]", github, "GitHub/Website"),
+    ]
+
+    for selector, val, label in mappings:
+        if not val:
+            continue
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible(timeout=1000):
+                if not loc.input_value():
+                    loc.fill(val)
+                    filled.append(label)
+        except Exception:
+            pass
+
+    # Cover letter
+    if cover_letter:
+        try:
+            cl_loc = page.locator("textarea[name*='cover' i], textarea[id*='cover' i], textarea[placeholder*='cover' i]").first
+            if cl_loc.count() > 0 and cl_loc.is_visible(timeout=1000):
+                if not cl_loc.input_value():
+                    cl_loc.fill(cover_letter)
+                    filled.append("Cover Letter")
+        except Exception:
+            pass
+
+    # Tailored resume upload
+    if resume_pdf_path and os.path.exists(resume_pdf_path):
+        try:
+            file_loc = page.locator("input[type='file']").first
+            if file_loc.count() > 0:
+                file_loc.set_input_files(resume_pdf_path)
+                filled.append("Tailored Resume PDF")
+        except Exception:
+            pass
+
+    return filled
+
+
 def application_agent(state):
-    return {"application_status": "ready"}
+    """Browser agent that visits the job link, pre-fills the form, and pauses for review."""
+    selected_job = state.get("selected_job", {})
+    profile = state.get("profile", {})
+    tailored_resume = state.get("tailored_resume", "")
+    cover_letter = state.get("cover_letter", "")
+
+    # Target URL lookup
+    job_url = selected_job.get("link") or selected_job.get("share_link")
+    if not job_url and selected_job.get("apply_options"):
+        job_url = selected_job["apply_options"][0].get("link")
+
+    if not job_url:
+        return {"application_status": "skipped (no link provided)"}
+
+    # Generate temporary PDF for upload
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+
+    status = "ready"
+    browser = None
+    playwright_ctx = None
+
+    try:
+        from playwright.sync_api import sync_playwright
+
+        text_to_pdf(tailored_resume, temp_pdf_path)
+
+        playwright_ctx = sync_playwright().start()
+        # Headed by default so candidate can watch & bypass CAPTCHA/login; configurable via env
+        headless = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() in {"true", "1", "yes"}
+        browser = launch_playwright_browser(playwright_ctx, headless=headless)
+        context = browser.new_context()
+        page = context.new_page()
+
+        print(f"\n[Application Agent] Opening job application: {job_url}")
+        page.goto(job_url, timeout=30000, wait_until="domcontentloaded")
+        page.wait_for_timeout(2500)
+
+        filled_fields = autofill_job_application(page, profile, temp_pdf_path, cover_letter)
+
+        # Human-in-the-loop review checkpoint
+        result = interrupt({
+            "type": "submit_confirmation",
+            "message": f"Pre-filled application for {selected_job.get('title', 'Role')} at {selected_job.get('company', 'Company')}. Please review the open browser window and approve to submit.",
+            "job_url": job_url,
+            "fields_filled": filled_fields
+        })
+
+        if is_approved(result):
+            # Attempt to click submit button
+            submit_selectors = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button:has-text('Submit Application')",
+                "button:has-text('Submit')",
+                "button:has-text('Apply')",
+            ]
+            submitted = False
+            for btn_sel in submit_selectors:
+                try:
+                    btn = page.locator(btn_sel).first
+                    if btn.count() > 0 and btn.is_visible(timeout=1000):
+                        btn.click()
+                        submitted = True
+                        page.wait_for_timeout(3000)
+                        break
+                except Exception:
+                    pass
+
+            status = "submitted" if submitted else "ready_for_manual_submit"
+        else:
+            status = "saved_as_draft"
+
+    except ImportError:
+        status = "ready (playwright not installed)"
+    except Exception as e:
+        status = f"error: {str(e)}"
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright_ctx:
+            try:
+                playwright_ctx.stop()
+            except Exception:
+                pass
+        if os.path.exists(temp_pdf_path):
+            try:
+                os.remove(temp_pdf_path)
+            except Exception:
+                pass
+
+    return {"application_status": status}
 
 
 # --------------------------------------------------------------------------
@@ -508,7 +716,7 @@ def build_graph(checkpointer=None):
 
 
 if __name__ == "__main__":
-    # FIX: no hardcoded personal path. Usage: python graph.py path/to/resume.pdf
+     
     resume_path = sys.argv[1] if len(sys.argv) > 1 else os.getenv("RESUME_PATH")
     if not resume_path:
         raise SystemExit("Usage: python graph.py path/to/resume.pdf")
@@ -535,7 +743,7 @@ if __name__ == "__main__":
 
     config = {"configurable": {"thread_id": "user-1"}}
 
-    # Simple CLI loop: keep answering interrupts until the graph finishes
+     
     result = graph.invoke(initial_state, config=config)
     while result.get("__interrupt__"):
         payload = result["__interrupt__"][0].value
@@ -545,6 +753,11 @@ if __name__ == "__main__":
                 job = item.get("job", {})
                 print(f"{i}. {job.get('title', '')} | {job.get('company', '')} | "
                       f"Score: {item.get('score', '')}")
+        elif payload.get("type") == "submit_confirmation":
+            print(f"Target URL: {payload.get('job_url')}")
+            fields = payload.get("fields_filled", [])
+            print(f"Fields filled: {', '.join(fields) if fields else 'None detected'}")
+            print("Please review the open browser window. Type 'approve' to submit, or 'cancel' to save draft.")
         elif payload.get("resume"):
             print(payload["resume"])
             if payload.get("cover_letter"):
