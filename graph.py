@@ -560,58 +560,40 @@ def autofill_job_application(page, profile: dict, resume_pdf_path: str, cover_le
     return filled
 
 
-def application_agent(state):
-    """Browser agent that visits the job link, pre-fills the form, and pauses for review."""
-    selected_job = state.get("selected_job", {})
-    profile = state.get("profile", {})
-    tailored_resume = state.get("tailored_resume", "")
-    cover_letter = state.get("cover_letter", "")
+def _run_browser_phase(job_url: str, profile: dict, resume_pdf_path: str, cover_letter: str,
+                        headless: bool = False, submit: bool = False, screenshot_path: str = None):
+    """
+    Internal helper: opens browser, fills form, optionally submits.
+    Always closes browser before returning — safe to call around interrupt().
+    Returns (filled_fields, screenshot_bytes, submitted_bool, status_str)
+    """
+    from playwright.sync_api import sync_playwright
 
-    
-    job_url = selected_job.get("link") or selected_job.get("share_link")
-    if not job_url and selected_job.get("apply_options"):
-        job_url = selected_job["apply_options"][0].get("link")
-
-    if not job_url:
-        return {"application_status": "skipped (no link provided)"}
-
-     
-    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-    temp_pdf_path = temp_pdf.name
-    temp_pdf.close()
-
-    status = "ready"
+    playwright_ctx = sync_playwright().start()
     browser = None
-    playwright_ctx = None
+    filled_fields = []
+    screenshot_bytes = None
+    submitted = False
+    status = "ready"
 
     try:
-        from playwright.sync_api import sync_playwright
-
-        text_to_pdf(tailored_resume, temp_pdf_path)
-
-        playwright_ctx = sync_playwright().start()
-         
-        headless = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() in {"true", "1", "yes"}
         browser = launch_playwright_browser(playwright_ctx, headless=headless)
         context = browser.new_context()
         page = context.new_page()
+        page.set_viewport_size({"width": 1280, "height": 900})
 
-        print(f"\n[Application Agent] Opening job application: {job_url}")
+        print(f"[Application Agent] {'Submitting' if submit else 'Pre-filling'} job application: {job_url}")
+        if not submit:
+            print("[Application Agent] ⚠️  Browser window is open — review the pre-filled form above, then approve in the chat.")
+
         page.goto(job_url, timeout=30000, wait_until="domcontentloaded")
+        page.bring_to_front()
         page.wait_for_timeout(2500)
 
-        filled_fields = autofill_job_application(page, profile, temp_pdf_path, cover_letter)
+        filled_fields = autofill_job_application(page, profile, resume_pdf_path, cover_letter)
 
-         
-        result = interrupt({
-            "type": "submit_confirmation",
-            "message": f"Pre-filled application for {selected_job.get('title', 'Role')} at {selected_job.get('company', 'Company')}. Please review the open browser window and approve to submit.",
-            "job_url": job_url,
-            "fields_filled": filled_fields
-        })
-
-        if is_approved(result):
-            
+        if submit:
+            # --- Phase 2: click submit ---
             submit_selectors = [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -619,7 +601,6 @@ def application_agent(state):
                 "button:has-text('Submit')",
                 "button:has-text('Apply')",
             ]
-            submitted = False
             for btn_sel in submit_selectors:
                 try:
                     btn = page.locator(btn_sel).first
@@ -630,31 +611,113 @@ def application_agent(state):
                         break
                 except Exception:
                     pass
-
             status = "submitted" if submitted else "ready_for_manual_submit"
         else:
-            status = "saved_as_draft"
+            # --- Phase 1: take screenshot for review ---
+            if screenshot_path:
+                try:
+                    page.screenshot(path=screenshot_path, full_page=False)
+                    print(f"[Application Agent] Screenshot saved: {screenshot_path}")
+                except Exception as ss_err:
+                    print(f"[Application Agent] Screenshot failed: {ss_err}")
+            status = "pre_filled"
 
-    except ImportError:
-        status = "ready (playwright not installed)"
-    except Exception as e:
-        status = f"error: {str(e)}"
     finally:
         if browser:
             try:
                 browser.close()
             except Exception:
                 pass
-        if playwright_ctx:
-            try:
-                playwright_ctx.stop()
-            except Exception:
-                pass
-        if os.path.exists(temp_pdf_path):
-            try:
-                os.remove(temp_pdf_path)
-            except Exception:
-                pass
+        try:
+            playwright_ctx.stop()
+        except Exception:
+            pass
+
+    return filled_fields, submitted, status
+
+
+def application_agent(state):
+    """
+    Browser agent — two-phase design that works correctly with LangGraph interrupt().
+
+    Phase 1 (pre-fill):
+      Opens browser → fills form → takes screenshot → CLOSES browser → calls interrupt().
+      The browser is closed BEFORE interrupt() so the finally block has nothing to close.
+
+    Phase 2 (submit — runs after user approves):
+      Reopens browser → re-fills form → clicks submit → closes browser.
+    """
+    selected_job = state.get("selected_job", {})
+    profile       = state.get("profile", {})
+    tailored_resume = state.get("tailored_resume", "")
+    cover_letter  = state.get("cover_letter", "")
+
+    job_url = selected_job.get("link") or selected_job.get("share_link")
+    if not job_url and selected_job.get("apply_options"):
+        job_url = selected_job["apply_options"][0].get("link")
+
+    if not job_url:
+        return {"application_status": "skipped (no link provided)"}
+
+    # Build a temp PDF resume for upload
+    temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    temp_pdf_path = temp_pdf.name
+    temp_pdf.close()
+
+    # Screenshot path (shown in interrupt payload for review)
+    screenshot_path = temp_pdf_path.replace(".pdf", "_preview.png")
+
+    status = "ready"
+
+    try:
+        from playwright.sync_api import sync_playwright  # noqa: F401 — availability check
+
+        text_to_pdf(tailored_resume, temp_pdf_path)
+
+        headless = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() in {"true", "1", "yes"}
+
+        # ── PHASE 1: pre-fill and screenshot ─────────────────────────────────
+        # Browser is fully closed before interrupt() is called, so the
+        # GraphInterrupt exception won't trigger a stray browser.close().
+        filled_fields, _, _ = _run_browser_phase(
+            job_url, profile, temp_pdf_path, cover_letter,
+            headless=headless, submit=False, screenshot_path=screenshot_path
+        )
+
+        # ── INTERRUPT: pause and ask user to review ───────────────────────────
+        result = interrupt({
+            "type": "submit_confirmation",
+            "message": (
+                f"✅ Form pre-filled for {selected_job.get('title', 'Role')} "
+                f"at {selected_job.get('company', 'Company')}.\n"
+                "A screenshot of the filled form has been captured.\n"
+                "Reply **approve** to submit, or **reject** to cancel."
+            ),
+            "job_url": job_url,
+            "fields_filled": filled_fields,
+            "screenshot": screenshot_path if os.path.exists(screenshot_path) else None,
+        })
+
+        # ── PHASE 2: re-open and submit on approval ───────────────────────────
+        if is_approved(result):
+            _, submitted, status = _run_browser_phase(
+                job_url, profile, temp_pdf_path, cover_letter,
+                headless=headless, submit=True
+            )
+        else:
+            status = "saved_as_draft"
+
+    except ImportError:
+        status = "error: playwright not installed — run: pip install playwright && playwright install chromium"
+    except Exception as e:
+        status = f"error: {e}"
+    finally:
+        for path in [temp_pdf_path, screenshot_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
     return {"application_status": status}
 
