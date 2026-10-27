@@ -567,7 +567,7 @@ def application_agent(state):
     tailored_resume = state.get("tailored_resume", "")
     cover_letter = state.get("cover_letter", "")
 
-    # Target URL lookup
+    
     job_url = selected_job.get("link") or selected_job.get("share_link")
     if not job_url and selected_job.get("apply_options"):
         job_url = selected_job["apply_options"][0].get("link")
@@ -575,7 +575,7 @@ def application_agent(state):
     if not job_url:
         return {"application_status": "skipped (no link provided)"}
 
-    # Generate temporary PDF for upload
+     
     temp_pdf = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     temp_pdf_path = temp_pdf.name
     temp_pdf.close()
@@ -590,7 +590,7 @@ def application_agent(state):
         text_to_pdf(tailored_resume, temp_pdf_path)
 
         playwright_ctx = sync_playwright().start()
-        # Headed by default so candidate can watch & bypass CAPTCHA/login; configurable via env
+         
         headless = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() in {"true", "1", "yes"}
         browser = launch_playwright_browser(playwright_ctx, headless=headless)
         context = browser.new_context()
@@ -602,7 +602,7 @@ def application_agent(state):
 
         filled_fields = autofill_job_application(page, profile, temp_pdf_path, cover_letter)
 
-        # Human-in-the-loop review checkpoint
+         
         result = interrupt({
             "type": "submit_confirmation",
             "message": f"Pre-filled application for {selected_job.get('title', 'Role')} at {selected_job.get('company', 'Company')}. Please review the open browser window and approve to submit.",
@@ -611,7 +611,7 @@ def application_agent(state):
         })
 
         if is_approved(result):
-            # Attempt to click submit button
+            
             submit_selectors = [
                 "button[type='submit']",
                 "input[type='submit']",
